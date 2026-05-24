@@ -1,6 +1,7 @@
 // ==============================================================
 //  NIMO DESK BUDDY — ESP32-C3 Super Mini Edition
 //  SDA=4  SCL=5  TOUCH=3
+//  FIXED: async scan, single DNS call, deferred WiFi connect
 // ==============================================================
 //  FEATURES
 //  ─────────────────────────────────────────────────────────────
@@ -53,8 +54,23 @@ Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 MPU6050 mpu6050(Wire);
 
 // ── CAPTIVE PORTAL ────────────────────────────────────────────
-#define AP_SSID  "NIMO-Setup"
+#define AP_SSID      "NIMO-Setup"
+#define PORTAL_PIN   "5674"       // ← change this to your desired PIN
 #define DNS_PORT 53
+
+// Portal auth: track which client IPs have authenticated
+String authedIPs[8];
+int    authedIPCount = 0;
+
+bool isAuthed(String ip) {
+  for (int i = 0; i < authedIPCount; i++)
+    if (authedIPs[i] == ip) return true;
+  return false;
+}
+void addAuthed(String ip) {
+  if (isAuthed(ip)) return;
+  if (authedIPCount < 8) authedIPs[authedIPCount++] = ip;
+}
 
 WebServer   server(80);
 DNSServer   dnsServer;
@@ -64,11 +80,14 @@ bool wifiConfigured = false;
 bool portalActive   = false;
 bool wifiConnected  = false;
 
+// FIX: deferred connect flag — avoids blocking inside HTTP handler
+bool shouldConnect  = false;
+
 // ── ADMIN ─────────────────────────────────────────────────────
-bool adminMode          = false;       // shown on OLED
-bool adminServerRunning = false;       // WebServer already started
+bool adminMode          = false;
+bool adminServerRunning = false;
 unsigned long adminModeStart = 0;
-#define ADMIN_HOLD_MS  3000            // hold 3 s on face page → admin
+#define ADMIN_HOLD_MS  3000
 
 // ── CREDENTIALS ───────────────────────────────────────────────
 String savedSSID     = "";
@@ -160,7 +179,7 @@ int  tapCount = 0;
 unsigned long lastTap = 0;
 const unsigned long LONG_MS  = 800;
 const unsigned long DTAP_MS  = 300;
-const unsigned long ADMIN_MS = 3000;   // 3-second hold → admin
+const unsigned long ADMIN_MS = 3000;
 
 // ── BITMAPS ───────────────────────────────────────────────────
 const unsigned char bmp_clear[] PROGMEM = {
@@ -231,6 +250,109 @@ const unsigned char bmp_angry_mark[] PROGMEM = {
   0x3e,0x00,0x1c,0x00,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
   0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
 };
+
+// ══════════════════════════════════════════════════════════════
+//  PIN LOGIN HTML
+// ══════════════════════════════════════════════════════════════
+const char LOGIN_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>NIMO — Enter PIN</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+       background:#0f0f1a;color:#e8e8f0;min-height:100vh;
+       display:flex;align-items:center;justify-content:center;padding:16px}
+  .card{background:#1a1a2e;border-radius:20px;padding:36px 28px;
+        width:100%;max-width:340px;box-shadow:0 0 40px rgba(99,102,241,.25);text-align:center}
+  .logo-face{font-size:52px;line-height:1;margin-bottom:8px}
+  h1{font-size:20px;font-weight:700;color:#a5b4fc;letter-spacing:4px;margin-bottom:4px}
+  p{font-size:12px;color:#6366f1;margin-bottom:28px}
+  .pin-wrap{display:flex;gap:10px;justify-content:center;margin-bottom:24px}
+  .pin-dot{width:18px;height:18px;border-radius:50%;background:#2d2d5a;
+           transition:background .2s}
+  .pin-dot.filled{background:#6366f1}
+  .keypad{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px}
+  .key{padding:16px;background:#111130;border:1.5px solid #2d2d5a;border-radius:14px;
+       font-size:20px;font-weight:600;color:#e8e8f0;cursor:pointer;
+       transition:background .15s,border-color .15s;user-select:none}
+  .key:active,.key.pressed{background:#18184a;border-color:#6366f1}
+  .key.del{font-size:16px;color:#6366f1}
+  .key.zero{grid-column:2}
+  .err{font-size:13px;color:#f87171;min-height:20px;margin-top:4px}
+  .shake{animation:shake .35s ease}
+  @keyframes shake{0%,100%{transform:translateX(0)}
+    20%{transform:translateX(-8px)}40%{transform:translateX(8px)}
+    60%{transform:translateX(-6px)}80%{transform:translateX(6px)}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo-face">( &#9685; &#8767; &#9685; )</div>
+  <h1>N I M O</h1>
+  <p>Enter setup PIN to continue</p>
+  <div class="pin-wrap" id="dots">
+    <div class="pin-dot" id="d0"></div>
+    <div class="pin-dot" id="d1"></div>
+    <div class="pin-dot" id="d2"></div>
+    <div class="pin-dot" id="d3"></div>
+  </div>
+  <div class="keypad">
+    <div class="key" onclick="press('1')">1</div>
+    <div class="key" onclick="press('2')">2</div>
+    <div class="key" onclick="press('3')">3</div>
+    <div class="key" onclick="press('4')">4</div>
+    <div class="key" onclick="press('5')">5</div>
+    <div class="key" onclick="press('6')">6</div>
+    <div class="key" onclick="press('7')">7</div>
+    <div class="key" onclick="press('8')">8</div>
+    <div class="key" onclick="press('9')">9</div>
+    <div class="key del zero" onclick="del()">&#9003;</div>
+  </div>
+  <div class="err" id="err"></div>
+</div>
+<script>
+var pin='';
+function updateDots(){
+  for(var i=0;i<4;i++)
+    document.getElementById('d'+i).className='pin-dot'+(i<pin.length?' filled':'');
+}
+function press(d){
+  if(pin.length>=4) return;
+  pin+=d; updateDots();
+  if(pin.length===4) submit();
+}
+function del(){
+  pin=pin.slice(0,-1); updateDots();
+  document.getElementById('err').textContent='';
+}
+function submit(){
+  fetch('/login',{method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'pin='+encodeURIComponent(pin)})
+  .then(function(r){return r.text();})
+  .then(function(t){
+    if(t==='OK'){location.href='/';}
+    else{
+      document.getElementById('err').textContent='Wrong PIN. Try again.';
+      var d=document.getElementById('dots');
+      d.classList.remove('shake');
+      void d.offsetWidth;
+      d.classList.add('shake');
+      pin=''; updateDots();
+    }
+  }).catch(function(){
+    document.getElementById('err').textContent='Error. Try again.';
+    pin=''; updateDots();
+  });
+}
+</script>
+</body>
+</html>
+)rawliteral";
 
 // ══════════════════════════════════════════════════════════════
 //  SETUP PORTAL HTML
@@ -368,9 +490,13 @@ const char PORTAL_HTML[] PROGMEM = R"rawliteral(
     <button class="btn" type="submit">&#128190; Save &amp; Connect</button>
   </form>
   <div class="status" id="status"></div>
-  <div class="footer">NIMO Desk Buddy &bull; ESP32-C3 Super Mini</div>
+  <div class="footer">NIMO Desk Buddy</div>
 </div>
 <script>
+// ── FIX: async scan with polling ──────────────────────────────
+var scanPoller = null;
+var scanAttempts = 0;
+
 function rssiToBars(r){if(r>=-55)return 4;if(r>=-65)return 3;if(r>=-75)return 2;return 1;}
 function barHTML(rssi){
   var b=rssiToBars(rssi),h='<div class="rssi-bar">';
@@ -381,32 +507,66 @@ function escHtml(s){
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;')
           .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
-function doScan(){
+function renderNets(nets){
   var st=document.getElementById('scanStatus');
   var nl=document.getElementById('netList');
-  st.textContent='Scanning...';nl.innerHTML='';
-  fetch('/scan').then(function(r){return r.json();})
-  .then(function(nets){
-    if(!nets||nets.length===0){st.textContent='No networks found. Try again.';return;}
-    nets.sort(function(a,b){return b.rssi-a.rssi;});
-    st.textContent='Found '+nets.length+' network'+(nets.length>1?'s':'')+'. Tap to select.';
-    nl.innerHTML='';
-    nets.forEach(function(n){
-      var div=document.createElement('div');
-      div.className='net-item';
-      div.innerHTML='<span class="net-name">'+escHtml(n.ssid)+'</span>'
-        +'<span class="net-meta">'
-        +(n.open?'<span class="net-lock">&#128275;</span>':'<span class="net-lock">&#128274;</span>')
-        +barHTML(n.rssi)+'</span>';
-      div.addEventListener('click',function(){
-        selectNetwork(n.ssid,n.open);
-        document.querySelectorAll('.net-item').forEach(function(el){el.classList.remove('selected');});
-        div.classList.add('selected');
-      });
-      nl.appendChild(div);
+  if(!nets||nets.length===0){
+    st.textContent='No networks found. Try again.';
+    return;
+  }
+  nets.sort(function(a,b){return b.rssi-a.rssi;});
+  st.textContent='Found '+nets.length+' network'+(nets.length>1?'s':'')+'. Tap to select.';
+  nl.innerHTML='';
+  nets.forEach(function(n){
+    var div=document.createElement('div');
+    div.className='net-item';
+    div.innerHTML='<span class="net-name">'+escHtml(n.ssid)+'</span>'
+      +'<span class="net-meta">'
+      +(n.open?'<span class="net-lock">&#128275;</span>':'<span class="net-lock">&#128274;</span>')
+      +barHTML(n.rssi)+'</span>';
+    div.addEventListener('click',function(){
+      selectNetwork(n.ssid,n.open);
+      document.querySelectorAll('.net-item').forEach(function(el){el.classList.remove('selected');});
+      div.classList.add('selected');
     });
-  }).catch(function(){st.textContent='Scan failed. Check connection.';});
+    nl.appendChild(div);
+  });
 }
+
+function pollScan(){
+  fetch('/scan')
+    .then(function(r){return r.json();})
+    .then(function(nets){
+      if(!nets||nets.length===0){
+        // Still scanning — poll again
+        scanAttempts++;
+        if(scanAttempts<10){
+          scanPoller=setTimeout(pollScan,2000);
+          document.getElementById('scanStatus').textContent='Scanning... ('+scanAttempts+')';
+        } else {
+          document.getElementById('scanStatus').textContent='No networks found. Tap scan to retry.';
+        }
+        return;
+      }
+      renderNets(nets);
+    })
+    .catch(function(){
+      document.getElementById('scanStatus').textContent='Scan failed. Tap to retry.';
+    });
+}
+
+function doScan(){
+  if(scanPoller){clearTimeout(scanPoller);scanPoller=null;}
+  scanAttempts=0;
+  var st=document.getElementById('scanStatus');
+  st.textContent='Starting scan...';
+  document.getElementById('netList').innerHTML='';
+  // Kick off scan on device, then start polling
+  fetch('/scan_start')
+    .then(function(){ scanPoller=setTimeout(pollScan,2500); })
+    .catch(function(){ st.textContent='Could not reach device.'; });
+}
+
 function selectNetwork(ssid,isOpen){
   document.getElementById('ssid').value=ssid;
   document.getElementById('ssidManual').value=ssid;
@@ -416,11 +576,13 @@ function selectNetwork(ssid,isOpen){
   if(isOpen){p.value='';p.placeholder='No password (open network)';}
   else{p.placeholder='Enter WiFi password';p.focus();}
 }
+
 function togglePw(id,btn){
   var i=document.getElementById(id);
   if(i.type==='password'){i.type='text';btn.textContent='&#128584;';}
   else{i.type='password';btn.textContent='&#128065;';}
 }
+
 function save(e){
   e.preventDefault();
   var ssid=document.getElementById('ssid').value.trim();
@@ -445,7 +607,9 @@ function save(e){
     btn.disabled=false;btn.textContent='Save & Connect';
   });
 }
-window.addEventListener('load',function(){doScan();});
+
+// Do NOT auto-scan on load — avoids blocking server at startup
+// User taps Scan button manually
 </script>
 </body>
 </html>
@@ -471,18 +635,12 @@ const char ADMIN_HTML[] PROGMEM = R"rawliteral(
   .card{background:#1a1a2e;border-radius:16px;padding:20px;
         max-width:420px;margin:0 auto 16px;
         box-shadow:0 0 30px rgba(248,113,113,.1)}
-
-  /* ── System Info ── */
   .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
   .info-box{background:#111130;border-radius:12px;padding:14px;text-align:center}
   .info-val{font-size:20px;font-weight:700;color:#a5b4fc;margin-bottom:4px}
   .info-lbl{font-size:10px;color:#6366f1;text-transform:uppercase;letter-spacing:.08em}
-
-  /* ── Sections ── */
   .section-title{font-size:11px;font-weight:600;color:#f87171;
                  text-transform:uppercase;letter-spacing:.1em;margin-bottom:12px}
-
-  /* ── Action buttons ── */
   .action-btn{width:100%;padding:14px;border:none;border-radius:12px;
               font-size:15px;font-weight:600;cursor:pointer;margin-bottom:10px;
               transition:opacity .2s,transform .1s;letter-spacing:.3px;
@@ -491,8 +649,6 @@ const char ADMIN_HTML[] PROGMEM = R"rawliteral(
   .btn-restart{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000}
   .btn-portal {background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff}
   .btn-reset  {background:linear-gradient(135deg,#ef4444,#b91c1c);color:#fff}
-
-  /* ── Confirm overlay ── */
   .overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);
            display:none;align-items:center;justify-content:center;z-index:999;padding:20px}
   .overlay.show{display:flex}
@@ -505,54 +661,32 @@ const char ADMIN_HTML[] PROGMEM = R"rawliteral(
                       font-size:14px;font-weight:600;cursor:pointer}
   .btn-cancel{background:#1e1e40;color:#94a3b8;border:1.5px solid #2d2d5a}
   .btn-confirm{background:#ef4444;color:#fff}
-
-  /* ── Toast ── */
   .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);
          background:#1a1a2e;border:1.5px solid #6366f1;border-radius:12px;
          padding:12px 20px;font-size:13px;color:#a5b4fc;
          transition:transform .3s;white-space:nowrap;z-index:1000}
   .toast.show{transform:translateX(-50%) translateY(0)}
-
-  /* ── Wifi info ── */
   .wifi-row{display:flex;justify-content:space-between;align-items:center;
             padding:8px 0;border-bottom:1px solid #1e1e40;font-size:13px}
   .wifi-row:last-child{border:none}
   .wifi-key{color:#6366f1}
   .wifi-val{color:#e8e8f0;text-align:right;max-width:200px;word-break:break-all}
-
   .back-link{display:block;text-align:center;margin-top:10px;
              font-size:12px;color:#6366f1}
 </style>
 </head>
 <body>
-
 <h1>&#9881; ADMIN</h1>
-<p class="subtitle">NIMO Desk Buddy &bull; ESP32-C3</p>
-
-<!-- ── System Info ── -->
+<p class="subtitle">NIMO Desk Buddy</p>
 <div class="card">
   <div class="section-title">&#128202; System Info</div>
   <div class="info-grid">
-    <div class="info-box">
-      <div class="info-val" id="uptime">--</div>
-      <div class="info-lbl">Uptime</div>
-    </div>
-    <div class="info-box">
-      <div class="info-val" id="heap">--</div>
-      <div class="info-lbl">Free Heap</div>
-    </div>
-    <div class="info-box">
-      <div class="info-val" id="rssi">--</div>
-      <div class="info-lbl">WiFi RSSI</div>
-    </div>
-    <div class="info-box">
-      <div class="info-val" id="ip">--</div>
-      <div class="info-lbl">IP Address</div>
-    </div>
+    <div class="info-box"><div class="info-val" id="uptime">--</div><div class="info-lbl">Uptime</div></div>
+    <div class="info-box"><div class="info-val" id="heap">--</div><div class="info-lbl">Free Heap</div></div>
+    <div class="info-box"><div class="info-val" id="rssi">--</div><div class="info-lbl">WiFi RSSI</div></div>
+    <div class="info-box"><div class="info-val" id="ip">--</div><div class="info-lbl">IP Address</div></div>
   </div>
 </div>
-
-<!-- ── WiFi Details ── -->
 <div class="card">
   <div class="section-title">&#128246; WiFi Details</div>
   <div id="wifiDetails">
@@ -564,30 +698,16 @@ const char ADMIN_HTML[] PROGMEM = R"rawliteral(
     <div class="wifi-row"><span class="wifi-key">Timezone</span><span class="wifi-val" id="wi-tz">--</span></div>
   </div>
 </div>
-
-<!-- ── Actions ── -->
 <div class="card">
   <div class="section-title">&#9881; Actions</div>
-
   <button class="action-btn btn-restart" onclick="doAction('restart','Restart Device',
-    'NIMO will restart. The page will reload in 8 seconds.')">
-    &#128260; Restart Device
-  </button>
-
+    'NIMO will restart. The page will reload in 8 seconds.')">&#128260; Restart Device</button>
   <button class="action-btn btn-portal" onclick="doAction('portal','Open WiFi Setup',
-    'NIMO will restart into WiFi setup mode. Connect to the NIMO-Setup network.')">
-    &#128246; Re-open WiFi Setup
-  </button>
-
+    'NIMO will restart into WiFi setup mode. Connect to the NIMO-Setup network.')">&#128246; Re-open WiFi Setup</button>
   <button class="action-btn btn-reset" onclick="doAction('reset','Factory Reset',
-    'ALL saved data (WiFi, API key, city) will be erased. This cannot be undone!')">
-    &#128465; Factory Reset
-  </button>
+    'ALL saved data (WiFi, API key, city) will be erased. This cannot be undone!')">&#128465; Factory Reset</button>
 </div>
-
 <a class="back-link" href="/">&#8592; Back to Setup</a>
-
-<!-- ── Confirm Dialog ── -->
 <div class="overlay" id="overlay">
   <div class="confirm-box">
     <h3 id="confirmTitle">Confirm</h3>
@@ -598,82 +718,46 @@ const char ADMIN_HTML[] PROGMEM = R"rawliteral(
     </div>
   </div>
 </div>
-
-<!-- ── Toast ── -->
 <div class="toast" id="toast"></div>
-
 <script>
-var pendingAction = '';
-
-function doAction(action, title, msg) {
-  pendingAction = action;
-  document.getElementById('confirmTitle').textContent = title;
-  document.getElementById('confirmMsg').textContent   = msg;
+var pendingAction='';
+function doAction(action,title,msg){
+  pendingAction=action;
+  document.getElementById('confirmTitle').textContent=title;
+  document.getElementById('confirmMsg').textContent=msg;
   document.getElementById('overlay').classList.add('show');
 }
-
-function closeConfirm() {
-  document.getElementById('overlay').classList.remove('show');
-  pendingAction = '';
-}
-
-function confirmed() {
-  closeConfirm();
-  showToast('Sending command...');
-  fetch('/admin/action', {
-    method: 'POST',
-    headers: {'Content-Type':'application/x-www-form-urlencoded'},
-    body: 'action=' + pendingAction
+function closeConfirm(){document.getElementById('overlay').classList.remove('show');pendingAction='';}
+function confirmed(){
+  closeConfirm();showToast('Sending command...');
+  fetch('/admin/action',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'action='+pendingAction})
+  .then(function(r){return r.text();})
+  .then(function(){
+    if(pendingAction==='restart'){showToast('Restarting... reconnect in 8s');setTimeout(function(){location.reload();},8000);}
+    else if(pendingAction==='reset'){showToast('Reset done! Connect to NIMO-Setup');setTimeout(function(){location.href='http://192.168.4.1/';},5000);}
+    else if(pendingAction==='portal'){showToast('Opening setup... connect to NIMO-Setup');}
   })
-  .then(function(r){ return r.text(); })
-  .then(function(t){
-    if (pendingAction === 'restart') {
-      showToast('Restarting... reconnect in 8s');
-      setTimeout(function(){ location.reload(); }, 8000);
-    } else if (pendingAction === 'reset') {
-      showToast('Reset done! Connect to NIMO-Setup');
-      setTimeout(function(){ location.href = 'http://192.168.4.1/'; }, 5000);
-    } else if (pendingAction === 'portal') {
-      showToast('Opening setup... connect to NIMO-Setup');
-    }
-  })
-  .catch(function(){
-    showToast('Command sent (device may restart)');
-  });
+  .catch(function(){showToast('Command sent (device may restart)');});
 }
-
-function showToast(msg) {
-  var t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  setTimeout(function(){ t.classList.remove('show'); }, 3500);
+function showToast(msg){var t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(function(){t.classList.remove('show');},3500);}
+function loadInfo(){
+  fetch('/admin/info').then(function(r){return r.json();}).then(function(d){
+    var s=Math.floor(d.uptime/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;
+    var ut=h>0?h+'h '+m+'m':m>0?m+'m '+sec+'s':sec+'s';
+    document.getElementById('uptime').textContent=ut;
+    document.getElementById('heap').textContent=Math.round(d.heap/1024)+'KB';
+    document.getElementById('rssi').textContent=d.rssi+'dBm';
+    document.getElementById('ip').textContent=d.ip;
+    document.getElementById('wi-ssid').textContent=d.ssid;
+    document.getElementById('wi-ip').textContent=d.ip;
+    document.getElementById('wi-gw').textContent=d.gateway;
+    document.getElementById('wi-mac').textContent=d.mac;
+    document.getElementById('wi-city').textContent=d.city+', '+d.country;
+    document.getElementById('wi-tz').textContent=d.tz;
+  }).catch(function(){});
 }
-
-// ── Load system info ──────────────────────────────────────
-function loadInfo() {
-  fetch('/admin/info')
-  .then(function(r){ return r.json(); })
-  .then(function(d){
-    // Uptime formatting
-    var s = Math.floor(d.uptime / 1000);
-    var h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
-    var ut = h>0 ? h+'h '+m+'m' : m>0 ? m+'m '+sec+'s' : sec+'s';
-    document.getElementById('uptime').textContent   = ut;
-    document.getElementById('heap').textContent     = Math.round(d.heap/1024)+'KB';
-    document.getElementById('rssi').textContent     = d.rssi+'dBm';
-    document.getElementById('ip').textContent       = d.ip;
-    document.getElementById('wi-ssid').textContent  = d.ssid;
-    document.getElementById('wi-ip').textContent    = d.ip;
-    document.getElementById('wi-gw').textContent    = d.gateway;
-    document.getElementById('wi-mac').textContent   = d.mac;
-    document.getElementById('wi-city').textContent  = d.city + ', ' + d.country;
-    document.getElementById('wi-tz').textContent    = d.tz;
-  })
-  .catch(function(){ /* offline */ });
-}
-
-loadInfo();
-setInterval(loadInfo, 5000);   // refresh every 5 s
+loadInfo();setInterval(loadInfo,5000);
 </script>
 </body>
 </html>
@@ -683,9 +767,12 @@ setInterval(loadInfo, 5000);   // refresh every 5 s
 //  FORWARD DECLARATIONS
 // ══════════════════════════════════════════════════════════════
 void connectToWiFi();
+void startPortal();
 void startAdminServer();
+void handleLogin();
 void handleRoot();
 void handleSave();
+void handleScanStart();
 void handleScan();
 void handleCaptive();
 void handleCaptiveText();
@@ -697,15 +784,40 @@ void handleAdminAction();
 // ══════════════════════════════════════════════════════════════
 //  PORTAL HANDLERS
 // ══════════════════════════════════════════════════════════════
+
+// Gate: redirect to login page if client is not authed
 void handleRoot() {
+  String clientIP = server.client().remoteIP().toString();
+  if (portalActive && !isAuthed(clientIP)) {
+    server.sendHeader("Location","http://192.168.4.1/login",true);
+    server.send(302,"text/plain","");
+    return;
+  }
   server.send_P(200, "text/html", PORTAL_HTML);
+}
+
+// PIN login handler
+void handleLogin() {
+  if (server.method() == HTTP_GET) {
+    server.send_P(200, "text/html", LOGIN_HTML);
+    return;
+  }
+  // POST — check PIN
+  String entered = server.arg("pin");
+  String clientIP = server.client().remoteIP().toString();
+  if (entered == String(PORTAL_PIN)) {
+    addAuthed(clientIP);
+    server.send(200,"text/plain","OK");
+  } else {
+    server.send(200,"text/plain","FAIL");
+  }
 }
 
 void handleCaptive() {
   String html = "<!DOCTYPE html><html><head>"
-    "<meta http-equiv='refresh' content='0;url=http://192.168.4.1/'>"
+    "<meta http-equiv='refresh' content='0;url=http://192.168.4.1/login'>"
     "<title>NIMO</title></head><body>"
-    "<script>window.location='http://192.168.4.1/';<\/script>"
+    "<script>window.location='http://192.168.4.1/login';<\/script>"
     "</body></html>";
   server.sendHeader("Cache-Control","no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma","no-cache");
@@ -722,32 +834,58 @@ void handleNotFound() {
   server.sendHeader("Cache-Control","no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma","no-cache");
   server.sendHeader("Expires","-1");
-  server.sendHeader("Location","http://192.168.4.1/",true);
+  server.sendHeader("Location","http://192.168.4.1/login",true);
   server.send(302,"text/plain","");
 }
 
+// FIX: Split scan into two endpoints:
+//   /scan_start  → kicks off async scan, returns immediately
+//   /scan        → returns results (empty array if still scanning)
+void handleScanStart() {
+  // Start async scan (non-blocking)
+  WiFi.scanNetworks(true /*async*/, false /*show hidden*/);
+  server.sendHeader("Cache-Control","no-cache");
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  server.send(200,"text/plain","OK");
+}
+
 void handleScan() {
-  int n = WiFi.scanNetworks(false,false);
+  int n = WiFi.scanComplete();
+
+  if (n == WIFI_SCAN_RUNNING || n == WIFI_SCAN_FAILED) {
+    // Not ready yet — return empty array; JS will poll again
+    server.sendHeader("Cache-Control","no-cache");
+    server.sendHeader("Access-Control-Allow-Origin","*");
+    server.send(200,"application/json","[]");
+    return;
+  }
+
   String json = "[";
-  for (int i=0;i<n;i++) {
-    if(i>0) json+=",";
-    bool isOpen = (WiFi.encryptionType(i)==WIFI_AUTH_OPEN);
+  for (int i = 0; i < n; i++) {
+    if (i > 0) json += ",";
+    bool isOpen = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
     String ssid = WiFi.SSID(i);
     ssid.replace("\"","\\\"");
-    json += "{\"ssid\":\""+ssid+"\","
-            "\"rssi\":"+String(WiFi.RSSI(i))+","
-            "\"open\":"+(isOpen?"true":"false")+"}";
+    json += "{\"ssid\":\"" + ssid + "\","
+            "\"rssi\":"    + String(WiFi.RSSI(i)) + ","
+            "\"open\":"    + (isOpen ? "true" : "false") + "}";
   }
   json += "]";
-  WiFi.scanDelete();
+  WiFi.scanDelete();  // free memory after reading
+
   server.sendHeader("Cache-Control","no-cache");
   server.sendHeader("Access-Control-Allow-Origin","*");
   server.send(200,"application/json",json);
 }
 
 void handleSave() {
-  if(server.method()!=HTTP_POST){
+  if (server.method() != HTTP_POST) {
     server.send(405,"text/plain","Method Not Allowed"); return;
+  }
+  // Auth check
+  String clientIP = server.client().remoteIP().toString();
+  if (portalActive && !isAuthed(clientIP)) {
+    server.send(403,"text/plain","Not authorised"); return;
   }
   savedSSID     = server.arg("ssid");
   savedPass     = server.arg("pass");
@@ -756,9 +894,10 @@ void handleSave() {
   savedCountry  = server.arg("country");
   savedTimezone = server.arg("tz");
 
-  if(savedSSID.length()==0){
+  if (savedSSID.length() == 0) {
     server.send(400,"text/plain","ERR: SSID required"); return;
   }
+
   prefs.begin("nimo",false);
   prefs.putString("ssid",    savedSSID);
   prefs.putString("pass",    savedPass);
@@ -768,14 +907,11 @@ void handleSave() {
   prefs.putString("tz",      savedTimezone);
   prefs.end();
 
+  // FIX: Respond FIRST, then set flag — never block inside handler
   server.send(200,"text/plain","OK");
-  delay(500);
-  portalActive   = false;
-  wifiConfigured = true;
-  WiFi.softAPdisconnect(true);
-  dnsServer.stop();
-  delay(300);
-  connectToWiFi();
+
+  // Signal loop() to connect after response is flushed
+  shouldConnect = true;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -786,7 +922,6 @@ void handleAdmin() {
 }
 
 void handleAdminInfo() {
-  // Return JSON with live system stats
   String ip      = WiFi.localIP().toString();
   String gateway = WiFi.gatewayIP().toString();
   String mac     = WiFi.macAddress();
@@ -795,16 +930,16 @@ void handleAdminInfo() {
   unsigned long up = millis();
 
   String json = "{";
-  json += "\"uptime\":"  + String(up)   + ",";
-  json += "\"heap\":"    + String(heap) + ",";
-  json += "\"rssi\":"    + String(rssi) + ",";
-  json += "\"ip\":\""    + ip           + "\",";
-  json += "\"gateway\":\"" + gateway    + "\",";
-  json += "\"mac\":\""   + mac          + "\",";
-  json += "\"ssid\":\""  + savedSSID    + "\",";
-  json += "\"city\":\""  + savedCity    + "\",";
+  json += "\"uptime\":"    + String(up)   + ",";
+  json += "\"heap\":"      + String(heap) + ",";
+  json += "\"rssi\":"      + String(rssi) + ",";
+  json += "\"ip\":\""      + ip           + "\",";
+  json += "\"gateway\":\"" + gateway      + "\",";
+  json += "\"mac\":\""     + mac          + "\",";
+  json += "\"ssid\":\""    + savedSSID    + "\",";
+  json += "\"city\":\""    + savedCity    + "\",";
   json += "\"country\":\"" + savedCountry + "\",";
-  json += "\"tz\":\""    + savedTimezone + "\"";
+  json += "\"tz\":\""      + savedTimezone + "\"";
   json += "}";
 
   server.sendHeader("Cache-Control","no-cache");
@@ -813,15 +948,14 @@ void handleAdminInfo() {
 }
 
 void handleAdminAction() {
-  if(server.method()!=HTTP_POST){
+  if (server.method() != HTTP_POST) {
     server.send(405,"text/plain","Method Not Allowed"); return;
   }
   String action = server.arg("action");
   server.send(200,"text/plain","OK");   // respond BEFORE acting
   delay(200);
 
-  if(action=="restart"){
-    // Show restart screen on OLED
+  if (action == "restart") {
     display.clearDisplay();
     display.setFont(NULL);
     display.setCursor(22,20); display.print("Restarting...");
@@ -830,8 +964,7 @@ void handleAdminAction() {
     delay(1000);
     ESP.restart();
   }
-  else if(action=="reset"){
-    // Factory reset: wipe all NVS
+  else if (action == "reset") {
     display.clearDisplay();
     display.setFont(NULL);
     display.setCursor(18,16); display.print("Factory Reset!");
@@ -839,24 +972,35 @@ void handleAdminAction() {
     display.setCursor(10,44); display.print("Restarting...");
     display.display();
     delay(800);
+
     prefs.begin("nimo",false);
     prefs.clear();
     prefs.end();
+
+    WiFi.disconnect(true, true);
     delay(500);
+
+    Preferences wifiPrefs;
+    wifiPrefs.begin("nvs.net80211",false);
+    wifiPrefs.clear();
+    wifiPrefs.end();
+
+    delay(300);
     ESP.restart();
   }
-  else if(action=="portal"){
-    // Restart into portal mode
+  else if (action == "portal") {
     display.clearDisplay();
     display.setFont(NULL);
     display.setCursor(8,20);  display.print("Opening WiFi");
     display.setCursor(8,34);  display.print("Setup Portal...");
     display.display();
     delay(800);
-    // Clear SSID so setup() goes to portal on restart
+
     prefs.begin("nimo",false);
     prefs.putString("ssid","");
     prefs.end();
+
+    WiFi.disconnect(true,true);
     delay(300);
     ESP.restart();
   }
@@ -866,15 +1010,19 @@ void handleAdminAction() {
 //  WIFI HELPERS
 // ══════════════════════════════════════════════════════════════
 void startPortal() {
+  // Reset auth list each time portal opens
+  authedIPCount = 0;
+  for (int i = 0; i < 8; i++) authedIPs[i] = "";
+
   display.clearDisplay();
   display.setFont(NULL);
   display.setTextColor(SH110X_WHITE);
   display.setCursor(8, 0);  display.print("WiFi Setup Mode");
-  display.setCursor(0,14);  display.print("Connect to:");
-  display.setCursor(0,24);  display.print(AP_SSID);
+  display.setCursor(0,12);  display.print("Connect to:");
+  display.setCursor(0,22);  display.print(AP_SSID);
   display.setCursor(0,34);  display.print("No password needed");
-  display.setCursor(0,46);  display.print("Open any website");
-  display.setCursor(0,56);  display.print("in your browser");
+  display.setCursor(0,44);  display.print("Setup PIN:");
+  display.setCursor(0,54);  display.print(PORTAL_PIN);
   display.display();
 
   WiFi.mode(WIFI_AP_STA);
@@ -890,7 +1038,10 @@ void startPortal() {
 
   server.on("/",                          HTTP_GET,  handleRoot);
   server.on("/index.html",                HTTP_GET,  handleRoot);
+  server.on("/login",                     HTTP_GET,  handleLogin);
+  server.on("/login",                     HTTP_POST, handleLogin);
   server.on("/save",                      HTTP_POST, handleSave);
+  server.on("/scan_start",                HTTP_GET,  handleScanStart);
   server.on("/scan",                      HTTP_GET,  handleScan);
   server.on("/generate_204",              HTTP_GET,  handleCaptive);
   server.on("/gen_204",                   HTTP_GET,  handleCaptive);
@@ -907,14 +1058,14 @@ void startPortal() {
   portalActive = true;
 }
 
-// ── Start admin web server on normal WiFi ─────────────────────
 void startAdminServer() {
-  if(adminServerRunning) return;
-  server.on("/",                HTTP_GET,  handleRoot);        // redirect to admin
-  server.on("/admin",           HTTP_GET,  handleAdmin);
-  server.on("/admin/info",      HTTP_GET,  handleAdminInfo);
-  server.on("/admin/action",    HTTP_POST, handleAdminAction);
-  server.on("/scan",            HTTP_GET,  handleScan);        // also expose scan
+  if (adminServerRunning) return;
+  server.on("/",             HTTP_GET,  handleRoot);
+  server.on("/admin",        HTTP_GET,  handleAdmin);
+  server.on("/admin/info",   HTTP_GET,  handleAdminInfo);
+  server.on("/admin/action", HTTP_POST, handleAdminAction);
+  server.on("/scan_start",   HTTP_GET,  handleScanStart);
+  server.on("/scan",         HTTP_GET,  handleScan);
   server.onNotFound([](){ server.sendHeader("Location","/admin",true); server.send(302); });
   server.begin();
   adminServerRunning = true;
@@ -924,25 +1075,35 @@ void startAdminServer() {
 }
 
 void connectToWiFi() {
-  if(savedSSID.length()==0) return;
+  if (savedSSID.length() == 0) { startPortal(); return; }
 
   display.clearDisplay();
   display.setFont(NULL);
-  display.setCursor(10,24); display.print("Connecting WiFi...");
+  display.setCursor(10,16); display.print("Connecting to:");
+  display.setCursor(0,28);  display.print(savedSSID);
+  display.setCursor(10,40); display.print("Please wait...");
   display.display();
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(savedSSID.c_str(),savedPass.c_str());
+  WiFi.disconnect(false,false);
+  delay(100);
+  WiFi.begin(savedSSID.c_str(), savedPass.c_str());
 
-  unsigned long t0=millis();
-  while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000){
+  unsigned long t0 = millis();
+  int dots = 0;
+  while (WiFi.status() != WL_CONNECTED && millis()-t0 < 15000) {
     delay(400);
-    display.print(".");
+    // Animated dots on screen
+    display.fillRect(0, 52, 128, 12, SH110X_BLACK);
+    String d = "";
+    for (int i=0; i<=dots; i++) d += ".";
+    display.setCursor(10, 54); display.print(d);
     display.display();
+    dots = (dots + 1) % 5;
   }
-  wifiConnected = (WiFi.status()==WL_CONNECTED);
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
 
-  if(wifiConnected){
+  if (wifiConnected) {
     display.clearDisplay();
     display.setFont(NULL);
     display.setCursor(20,16); display.print("WiFi Connected!");
@@ -955,15 +1116,28 @@ void connectToWiFi() {
     tzset();
 
     struct tm ti; unsigned long nt=millis();
-    while(!getLocalTime(&ti,200)&&millis()-nt<5000) delay(200);
+    while (!getLocalTime(&ti,200) && millis()-nt < 5000) delay(200);
     ntpSynced = getLocalTime(&ti,200);
 
     startAdminServer();
   } else {
+    // ── FIX: WiFi not found → show message then open setup portal ──
     display.clearDisplay();
-    display.setCursor(15,24); display.print("WiFi Failed!");
-    display.setCursor(5,40);  display.print("Hold touch to retry");
-    display.display(); delay(2500);
+    display.setFont(NULL);
+    display.setCursor(15,8);  display.print("WiFi Not Found!");
+    display.setCursor(0,22);  display.print(savedSSID);
+    display.setCursor(0,36);  display.print("Opening setup...");
+    display.setCursor(0,50);  display.print("Connect: " AP_SSID);
+    display.display();
+    delay(3000);
+
+    // Clear only SSID so user is forced back to portal
+    prefs.begin("nimo",false);
+    prefs.putString("ssid","");
+    prefs.end();
+    savedSSID = "";
+
+    startPortal();
   }
 }
 
@@ -977,7 +1151,7 @@ void calibrateMPU() {
   display.setCursor(8,30);  display.print("Keep device STILL");
   display.display();
   float sx=0,sy=0;
-  for(int i=0;i<CALIB_SAMPLES;i++){
+  for (int i=0;i<CALIB_SAMPLES;i++) {
     mpu6050.update();
     sx+=mpu6050.getAngleX();
     sy+=mpu6050.getAngleY();
@@ -992,15 +1166,13 @@ void calibrateMPU() {
 }
 
 void updateMotion() {
-  if(!calibrated) return;
+  if (!calibrated) return;
   mpu6050.update();
 
   float rawX = mpu6050.getAngleX();
   float rawY = mpu6050.getAngleY();
-
   float tiltFB =  (rawX - calibX);
   float tiltLR = -(rawY - calibY);
-
   currentRoll  = tiltLR;
   currentPitch = tiltFB;
 
@@ -1008,17 +1180,17 @@ void updateMotion() {
   float shake=(fabs(ax-lastAX)+fabs(ay-lastAY)+fabs(az-lastAZ))*10.0f;
   shakeIntensity=shake;
 
-  if(shake>20.0f&&!isShaking&&!isAngry&&currentPage==0){
+  if (shake>20.0f && !isShaking && !isAngry && currentPage==0) {
     isShaking=true; shakeEnd=millis()+1500; currentMood=MOOD_DIZZY;
   }
-  if(isShaking&&millis()>=shakeEnd){
+  if (isShaking && millis()>=shakeEnd) {
     isShaking=false; isAngry=true; angryEnd=millis()+2000; currentMood=MOOD_ANGRY;
   }
-  if(isAngry&&millis()>=angryEnd){
+  if (isAngry && millis()>=angryEnd) {
     isAngry=false; currentMood=weatherMood;
   }
 
-  if(!isShaking&&!isAngry&&currentPage==0){
+  if (!isShaking && !isAngry && currentPage==0) {
     float rx=constrain(tiltLR/5.0f,-12.f,12.f);
     float ry=constrain(tiltFB/5.0f,-10.f,10.f);
     pupilCurrX=pupilCurrX*0.6f+rx*0.4f;
@@ -1046,12 +1218,12 @@ const unsigned char* miniIcon(String w){
 }
 
 void updateWeatherMood(){
-  if(wx_main=="Clear")                         weatherMood=MOOD_HAPPY;
-  else if(wx_main=="Rain"||wx_main=="Drizzle") weatherMood=MOOD_SAD;
-  else if(wx_main=="Thunderstorm")             weatherMood=MOOD_SURPRISED;
-  else if(wx_temp>35)                          weatherMood=MOOD_ANGRY;
-  else if(wx_temp<10)                          weatherMood=MOOD_SLEEPY;
-  else                                         weatherMood=MOOD_NORMAL;
+  if(wx_main=="Clear")                          weatherMood=MOOD_HAPPY;
+  else if(wx_main=="Rain"||wx_main=="Drizzle")  weatherMood=MOOD_SAD;
+  else if(wx_main=="Thunderstorm")              weatherMood=MOOD_SURPRISED;
+  else if(wx_temp>35)                           weatherMood=MOOD_ANGRY;
+  else if(wx_temp<10)                           weatherMood=MOOD_SLEEPY;
+  else                                          weatherMood=MOOD_NORMAL;
   if(!isShaking&&!isAngry) currentMood=weatherMood;
 }
 
@@ -1097,7 +1269,7 @@ void fetchWeather(){
 }
 
 // ══════════════════════════════════════════════════════════════
-//  TOUCH  (extended with 3-second admin trigger)
+//  TOUCH
 // ══════════════════════════════════════════════════════════════
 void handleTouch(){
   bool cur=digitalRead(TOUCH_PIN);
@@ -1109,12 +1281,11 @@ void handleTouch(){
   else if(cur&&lastPin){
     unsigned long held=now-pressStart;
 
-    // ── 3-second hold on face page → admin mode ───────────
+    // 3-second hold on face page → admin mode
     if(held>=ADMIN_MS && !longHandled && currentPage==0 && !adminMode){
       adminMode=true;
       adminModeStart=now;
       longHandled=true;
-      // Show admin info on OLED
       display.clearDisplay();
       display.setFont(NULL);
       display.setTextColor(SH110X_WHITE);
@@ -1127,19 +1298,18 @@ void handleTouch(){
       return;
     }
 
-    // ── Normal 800ms long press ───────────────────────────
+    // Normal 800ms long press
     if(held>=LONG_MS && !longHandled && held<ADMIN_MS){
       if(currentPage==0&&!isShaking&&!isAngry){
         currentMood=(currentMood+1)%(MOOD_SUSPICIOUS+1);
         weatherMood=currentMood;
       } else if(currentPage==1){ subPage=(subPage==1)?0:1; }
-      else if(currentPage==2){ subPage=(subPage==2)?0:2; }
+        else if(currentPage==2){ subPage=(subPage==2)?0:2; }
       longHandled=true;
     }
   }
   else if(!cur&&lastPin){
     if(now-pressStart<LONG_MS&&!longHandled){
-      // Short tap: exit admin mode if active
       if(adminMode){
         adminMode=false;
       } else {
@@ -1149,7 +1319,7 @@ void handleTouch(){
   }
   lastPin=cur;
 
-  // Auto-exit admin mode after 30 s
+  // Auto-exit admin mode after 30s
   if(adminMode && now-adminModeStart>30000){
     adminMode=false;
   }
@@ -1275,10 +1445,9 @@ void drawFacePage(){
   }
   drawMouth();
   if(!isShaking&&!isAngry){
-    if(currentMood==MOOD_LOVE)  display.drawBitmap(56,0,bmp_heart,16,16,SH110X_WHITE);
-    if(currentMood==MOOD_SLEEPY)display.drawBitmap(110,0,bmp_zzz,16,16,SH110X_WHITE);
+    if(currentMood==MOOD_LOVE)   display.drawBitmap(56,0,bmp_heart,16,16,SH110X_WHITE);
+    if(currentMood==MOOD_SLEEPY) display.drawBitmap(110,0,bmp_zzz,16,16,SH110X_WHITE);
   }
-  // Admin mode indicator: small gear icon top-left when active
   if(adminMode){
     display.setFont(NULL);
     display.setCursor(0,0); display.print("ADM");
@@ -1381,11 +1550,9 @@ void drawForecastPage(){
   }
 }
 
-// ── Draw admin OLED screen ────────────────────────────────────
 void drawAdminPage(){
   display.setFont(NULL);
   display.setTextColor(SH110X_WHITE);
-  // Blinking header bar
   if((millis()/500)%2==0){
     display.fillRect(0,0,128,12,SH110X_WHITE);
     display.setTextColor(SH110X_BLACK);
@@ -1399,7 +1566,6 @@ void drawAdminPage(){
   display.setCursor(0,28); display.print("Open in browser:");
   display.setCursor(0,40); display.print(WiFi.localIP().toString());
   display.setCursor(0,52); display.print("/admin");
-  // Countdown
   int remaining=(int)(30000-(millis()-adminModeStart))/1000;
   display.setCursor(100,52);
   display.print(remaining); display.print("s");
@@ -1475,16 +1641,29 @@ void setup(){
 //  LOOP
 // ══════════════════════════════════════════════════════════════
 void loop(){
+  // FIX: Only ONE dnsServer.processNextRequest() per loop iteration
   if(portalActive){
-    dnsServer.processNextRequest();
-    server.handleClient();
     dnsServer.processNextRequest();
     server.handleClient();
   }
 
-  // Admin server runs on normal WiFi
+  // Admin / normal WiFi server
   if(wifiConnected && adminServerRunning){
     server.handleClient();
+  }
+
+  // FIX: Deferred connect — triggered by handleSave() flag
+  if(shouldConnect){
+    shouldConnect = false;
+    portalActive  = false;
+    WiFi.softAPdisconnect(true);
+    dnsServer.stop();
+    delay(500);   // let the HTTP response fully flush first
+    connectToWiFi();
+    if(wifiConnected){
+      fetchWeather();
+      lastWxUpdate=millis();
+    }
   }
 
   handleTouch();
@@ -1506,7 +1685,6 @@ void loop(){
 
   display.clearDisplay();
 
-  // ── Show admin OLED screen when admin mode active ─────────
   if(adminMode){
     drawAdminPage();
   } else if(currentPage==0){
